@@ -74,23 +74,6 @@ class Args:
     """coefficient of the value function"""
     max_grad_norm: float = 0.5
     """the maximum norm for the gradient clipping"""
-    target_kl: float = None
-    """the target KL divergence threshold"""
-    use_kl_penalty: bool = False
-    """whether to use KL penalty instead of clipping"""
-    kl_penalty_coef: float = 1.0
-    """the coefficient of the KL penalty"""
-    kl_direction: str = "forward"
-    mdpo_anneal_kl_penalty: bool = False
-    """whether to use KL penalty with MDPO annealing"""
-    anneal_kl_penalty: bool = False
-    """whether to use KL penalty with linear annealing"""
-    adaptive_kl_penalty: bool = False
-    """whether to use adaptive KL penalty"""
-    kl_penalty_target: float = 0.01
-    kl_lower_bound: float = 0.0
-    """Loss is not penalized if KL is below this value"""
-    kl_estimator: str = "low_var"
     normalize_obs: bool = True
     """whether to normalize the observation"""
     normalize_reward: bool = True
@@ -104,15 +87,8 @@ class Args:
     num_iterations: int = 0
     """the number of iterations (computed in runtime)"""
     loss_name: str = "ppo"  # one of "mdpo", "ppo", "klppo", "zeroeta"
-    sparsity_steps: int = 1
-    """number of steps to skip before giving reward. -1 holds reward till end of episode"""
-    is_bandit: bool = False
-    """Whether to run the environment as a bandit problem (rewards only returned at end of episode, total reward used as reward for all states)"""
-    is_discretized: bool = False
-    """Whether to use discretized actions"""
-    num_bins: int = 7
-    """number of bins for discretized actions, only used if is_discretized=True"""
     use_spma: bool = False
+    target_kl: float = None
 
 
 def make_env(
@@ -428,13 +404,8 @@ if __name__ == "__main__":
     args.vf_minibatch_size = int(args.batch_size // args.vf_num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
     # run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
-    if args.use_kl_penalty:
-        if args.kl_penalty_coef == 0.0:
-            args.loss_name = "zeroeta"
-        elif args.kl_direction == "forward":
-            args.loss_name = "klppo"
-        elif args.kl_direction == "reverse":
-            args.loss_name = "mdpo"
+    if args.use_spma:
+        args.loss_name = "sppo"
     else:
         args.loss_name = "ppo"
     run_name = args.exp_name
@@ -484,17 +455,7 @@ if __name__ == "__main__":
     assert isinstance(envs.single_action_space, gym.spaces.Box), (
         "only continuous action space is supported"
     )
-    if not args.is_discretized:
-        agent = Agent(envs, orthogonal=args.init_weight_orthogonal).to(device)
-    else:
-        agent = DiscretizedAgent(
-            envs,
-            orthogonal=args.init_weight_orthogonal,
-            num_bins=args.num_bins,
-        ).to(device)
-        assert args.kl_estimator != "closed_form_gaussian", (
-            "closed_form_gaussian kl estimator is not supported for discretized actions",
-        )
+    agent = Agent(envs, orthogonal=args.init_weight_orthogonal).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
     # ALGO Logic: Storage setup
@@ -520,22 +481,6 @@ if __name__ == "__main__":
     next_obs, _ = envs.reset(seed=args.seed)
     next_obs = torch.Tensor(next_obs).to(device)
     next_done = torch.zeros(args.num_envs).to(device)
-    if args.use_kl_penalty:
-        kl_penalty_coef = args.kl_penalty_coef
-        if args.adaptive_kl_penalty:
-            assert not args.mdpo_anneal_kl_penalty, (
-                "adaptive_kl_penalty and mdpo_anneal_kl_penalty cannot be used together"
-            )
-            assert not args.anneal_kl_penalty, (
-                "adaptive_kl_penalty and anneal_kl_penalty cannot be used together"
-            )
-        if args.mdpo_anneal_kl_penalty:
-            assert not args.adaptive_kl_penalty, (
-                "adaptive_kl_penalty and mdpo_anneal_kl_penalty cannot be used together"
-            )
-            assert not args.anneal_kl_penalty, (
-                "mdpo_anneal_kl_penalty and anneal_kl_penalty cannot be used together"
-            )
 
     for iteration in range(1, args.num_iterations + 1):
         # Annealing the rate if instructed to do so.
@@ -543,15 +488,6 @@ if __name__ == "__main__":
             frac = 1.0 - (iteration - 1.0) / args.num_iterations
             lrnow = frac * args.learning_rate
             optimizer.param_groups[0]["lr"] = lrnow
-        if args.use_kl_penalty and args.mdpo_anneal_kl_penalty:
-            kl_penalty_coef = args.kl_penalty_coef / (
-                1 - (iteration - 1) / args.num_iterations
-            )
-        if args.use_kl_penalty and args.anneal_kl_penalty:
-            kl_penalty_coef = args.kl_penalty_coef * (
-                1 - (iteration - 1) / args.num_iterations
-            )
-        reward_sum = 0
         for step in range(args.num_steps):
             global_step += args.num_envs
             obs[step] = next_obs
@@ -571,25 +507,8 @@ if __name__ == "__main__":
             next_obs, reward, terminations, truncations, infos = envs.step(
                 action.cpu().numpy(),
             )
-            if not args.is_bandit:
-                next_done = np.logical_or(terminations, truncations)
-                if args.sparsity_steps != 1:
-                    reward_sum += reward
-                if args.sparsity_steps == -1 and "final_info" in infos:
-                    rewards[step] = torch.tensor(reward_sum).to(device).view(-1)
-                    reward_sum = 0
-                if args.sparsity_steps > 1 and (
-                    step % args.sparsity_steps == 0 or "final_info" in infos
-                ):
-                    rewards[step] = torch.tensor(reward_sum).to(device).view(-1)
-                    reward_sum = 0
-                if args.sparsity_steps == 1:
-                    rewards[step] = torch.tensor(reward).to(device).view(-1)
-            else:
-                next_done = np.logical_or(terminations, truncations)
-                reward_sum += reward
-                if "final_info" in infos:
-                    rewards[:step] = torch.tensor(reward_sum).to(device).view(-1)
+            next_done = np.logical_or(terminations, truncations)
+            rewards[step] = torch.tensor(reward).to(device).view(-1)
             next_obs, next_done = (
                 torch.Tensor(next_obs).to(device),
                 torch.Tensor(next_done).to(device),
@@ -649,6 +568,10 @@ if __name__ == "__main__":
         b_inds = np.arange(args.batch_size)
         clipfracs = []
         grad_norms = []
+        logratios = []
+        max_logratios = []
+        ratios = []
+        max_ratios = []
         for epoch in range(args.update_epochs):
             np.random.shuffle(b_inds)
             for start in range(0, args.batch_size, args.minibatch_size):
@@ -663,83 +586,22 @@ if __name__ == "__main__":
                 )
                 logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()
-                if args.use_kl_penalty:
-                    with torch.no_grad():
-                        # forward KLs
-                        mc_forward_kl = (-logratio).mean()
-                        low_var_forward_kl = compute_low_var_kl(
-                            b_logprobs[mb_inds],
-                            newlogprob,
-                        ).mean()
-                        closed_form_forward_kl = closed_form_gaussian_kl(
-                            b_action_means[mb_inds],
-                            b_action_logstds[mb_inds],
-                            new_action_mean,
-                            new_action_logstd,
-                        ).mean()
-                        # reverse KLs
-                        mc_reverse_kl = (ratio * logratio).mean()
-                        low_var_reverse_kl = (
-                            ratio
-                            * compute_low_var_kl(
-                                newlogprob,
-                                b_logprobs[mb_inds],
-                            )
-                        ).mean()
-                        closed_form_reverse_kl = (
-                            ratio
-                            * closed_form_gaussian_kl(
-                                new_action_mean,
-                                new_action_logstd,
-                                b_action_means[mb_inds],
-                                b_action_logstds[mb_inds],
-                            )
-                        ).mean()
 
+                with torch.no_grad():
+                    # calculate approx_kl http://joschu.net/blog/kl-approx.html
+                    old_approx_kl = (-logratio).mean()
+                    approx_kl = ((ratio - 1) - logratio).mean()
+                    if args.use_spma:
                         clipfracs += [
-                            ((ratio - 1.0).abs() > args.clip_coef).float().mean(),
+                            torch.logical_or(
+                                ratio.gt(1 + args.clip_coef),
+                                ratio.lt(1 / (1 + args.clip_coef)),
+                            )
+                            .float()
+                            .mean()
+                            .item(),
                         ]
-                    if args.kl_direction == "forward":
-                        if args.kl_estimator == "low_var":
-                            approx_kl_full = compute_low_var_kl(
-                                b_logprobs[mb_inds],
-                                newlogprob,
-                            )
-                        elif args.kl_estimator == "standard":
-                            approx_kl_full = -logratio
-                        elif args.kl_estimator == "closed_form_gaussian":
-                            approx_kl_full = closed_form_gaussian_kl(
-                                b_action_means[mb_inds],
-                                b_action_logstds[mb_inds],
-                                new_action_mean,
-                                new_action_logstd,
-                            )
-                    elif args.kl_direction == "reverse":
-                        if args.kl_estimator == "low_var":
-                            approx_kl_full = ratio * compute_low_var_kl(
-                                newlogprob,
-                                b_logprobs[mb_inds],
-                            )
-                        elif args.kl_estimator == "standard":
-                            approx_kl_full = ratio * logratio
-                        elif args.kl_estimator == "closed_form_gaussian":
-                            approx_kl_full = ratio * closed_form_gaussian_kl(
-                                new_action_mean,
-                                new_action_logstd,
-                                b_action_means[mb_inds],
-                                b_action_logstds[mb_inds],
-                            )
                     else:
-                        raise ValueError(
-                            "kl_direction must be either 'forward' or 'reverse'",
-                        )
-                    approx_kl = approx_kl_full.mean()
-
-                else:
-                    with torch.no_grad():
-                        # calculate approx_kl http://joschu.net/blog/kl-approx.html
-                        old_approx_kl = (-logratio).mean()
-                        approx_kl = ((ratio - 1) - logratio).mean()
                         clipfracs += [
                             ((ratio - 1.0).abs() > args.clip_coef)
                             .float()
@@ -754,23 +616,15 @@ if __name__ == "__main__":
                     )
 
                 # Policy loss
-                if args.use_kl_penalty:
-                    pg_loss1 = -mb_advantages * ratio
-                    pg_loss = (
-                        pg_loss1
-                        + kl_penalty_coef
-                        * torch.max(
-                            torch.zeros_like(approx_kl),
-                            approx_kl - args.kl_lower_bound,
-                        )
-                    ).mean()
-                    with torch.no_grad():
-                        adv_kl_ratio = (pg_loss1 / (kl_penalty_coef * approx_kl)).mean()
-                        adv_kl_ratio_no_coef = (pg_loss1 / approx_kl).mean()
-                        adv_kl_ratio_sum = (
-                            pg_loss1.sum() / (kl_penalty_coef * approx_kl).sum()
-                        )
-                    adv_kl_ratio_sum_no_coef = pg_loss1.sum() / approx_kl.sum()
+                if args.use_spma:
+                    clip_logratio = torch.log(
+                        torch.clamp(
+                            ratio,
+                            1 / (1 + args.clip_coef),
+                            1 + args.clip_coef,
+                        ),
+                    )
+                    pg_loss = (-mb_advantages * clip_logratio).mean()
                 else:
                     pg_loss1 = -mb_advantages * ratio
                     pg_loss2 = -mb_advantages * torch.clamp(
@@ -779,9 +633,6 @@ if __name__ == "__main__":
                         1 + args.clip_coef,
                     )
                     pg_loss = torch.max(pg_loss1, pg_loss2).mean()
-                    with torch.no_grad():
-                        adv_kl_ratio_no_coef = (pg_loss1 / approx_kl).mean()
-                        adv_kl_ratio_sum_no_coef = pg_loss1.sum() / approx_kl.sum()
 
                 # Value loss
                 newvalue = newvalue.view(-1)
@@ -808,17 +659,13 @@ if __name__ == "__main__":
                     args.max_grad_norm,
                 )
                 grad_norms.append(grad_norm.sum().item())
+                logratios.append(logratio.mean().item())
+                max_logratios.append(logratio.max().item())
+                ratios.append(ratio.mean().item())
+                max_ratios.append(ratio.max().item())
                 optimizer.step()
             if args.target_kl is not None and approx_kl.item() > args.target_kl:
                 break
-        if args.use_kl_penalty and args.adaptive_kl_penalty:
-            kl_error = np.clip(
-                (approx_kl.item() - args.kl_penalty_target) / args.kl_penalty_target,
-                -0.2,
-                0.2,
-            )
-            # 0.1 here is from original paper, verl uses a horizon schedule curr_step/T instead
-            kl_penalty_coef = kl_penalty_coef * (1 + kl_error)
         # value function updates
         vf_grad_norms = []
 
@@ -832,58 +679,18 @@ if __name__ == "__main__":
             optimizer.param_groups[0]["lr"],
             global_step,
         )
-        if args.use_kl_penalty:
-            writer.add_scalar("charts/kl_penalty_coef", kl_penalty_coef, global_step)
-            writer.add_scalar("charts/adv_kl_ratio", adv_kl_ratio, global_step)
-            writer.add_scalar("charts/adv_kl_ratio_sum", adv_kl_ratio_sum, global_step)
-        writer.add_scalar(
-            "charts/adv_kl_ratio_no_coef",
-            adv_kl_ratio_no_coef.item(),
-            global_step,
-        )
-        writer.add_scalar(
-            "charts/adv_kl_ratio_sum_no_coef",
-            adv_kl_ratio_sum_no_coef.item(),
-            global_step,
-        )
         writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
         writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
         writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
-        writer.add_scalar(
-            "losses/mc_forward_kl",
-            mc_forward_kl.item(),
-            global_step,
-        )
-        writer.add_scalar(
-            "losses/low_var_forward_kl",
-            low_var_forward_kl.item(),
-            global_step,
-        )
-        writer.add_scalar(
-            "losses/closed_form_forward_kl",
-            closed_form_forward_kl.item(),
-            global_step,
-        )
-        writer.add_scalar(
-            "losses/mc_reverse_kl",
-            mc_reverse_kl.item(),
-            global_step,
-        )
-        writer.add_scalar(
-            "losses/low_var_reverse_kl",
-            low_var_reverse_kl.item(),
-            global_step,
-        )
-        writer.add_scalar(
-            "losses/closed_form_reverse_kl",
-            closed_form_reverse_kl.item(),
-            global_step,
-        )
         writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
         writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
         writer.add_scalar("losses/grad_norm", np.mean(grad_norms), global_step)
         writer.add_scalar("losses/vf_grad_norm", np.mean(vf_grad_norms), global_step)
         writer.add_scalar("losses/explained_variance", explained_var, global_step)
+        writer.add_scalar("losses/logratio", np.mean(logratios), global_step)
+        writer.add_scalar("losses/max_logratio", np.mean(max_logratios), global_step)
+        writer.add_scalar("losses/ratio", np.mean(ratios), global_step)
+        writer.add_scalar("losses/max_ratio", np.mean(max_ratios), global_step)
         print("SPS:", int(global_step / (time.time() - start_time)))
         writer.add_scalar(
             "charts/SPS",

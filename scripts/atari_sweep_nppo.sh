@@ -13,8 +13,8 @@
 #SBATCH --gres=gpu:1
 #SBATCH --account=kempner_kdbrantley_lab
 #SBATCH --partition=kempner_h100
-#SBATCH --array=0-3
-# #SBATCH --array=0-3
+#SBATCH --array=0-19
+# #SBATCH --array=0-19
 
 # environments=(
 #     "ALE/StarGunner-v5"
@@ -28,17 +28,19 @@ environments=(
     "ALE/Amidar-v5"
     "ALE/DemonAttack-v5"
     )
-environment=${environments[$SLURM_ARRAY_TASK_ID]}
-wandb_group="hard_clip_runs"
-# ETA=25.0
-ETA=1.0
-experiment_name="reverse_rerun_squared_kl_ent_0.01-$environment"
+INDEX=$SLURM_ARRAY_TASK_ID
+environment=${environments[$((INDEX % ${#environments[@]}))]}
+INDEX=$(( INDEX / ${#environments[@]} ))
+CLIP_COEFS=(0.05 0.1 0.2 0.5 1.0)
+CLIP_COEF=${CLIP_COEFS[$((INDEX % ${#CLIP_COEFS[@]}))]}
+wandb_group="log_clip_sweep"
+experiment_name="vf_clip_spma_reverse_$CLIP_COEF-$environment"
 ENT_COEF=0.01
 
 module load python
 conda activate cleanrl 
 echo which python 
-python cleanrl/ppo_atari.py \
+python cleanrl/nppo_atari_clipped.py \
     --exp_name=$experiment_name \
     --wandb_group=$wandb_group \
     --track \
@@ -46,9 +48,7 @@ python cleanrl/ppo_atari.py \
     --wandb_project_name="AtariRuns" \
     --capture_video \
     --cuda \
-    --use_kl_penalty \
-    --kl_estimator "squared" \
-    --kl_penalty_coef=$ETA \
+    --clip_coef=$CLIP_COEF \
     --kl_direction="reverse" \
-    --ent_coef=$ENT_COEF
-
+    --ent_coef=$ENT_COEF \
+    --use_spma

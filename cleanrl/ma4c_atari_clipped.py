@@ -41,14 +41,7 @@ class Args:
     capture_video: bool = False
     """whether to capture videos of the agent performances (check out `videos` folder)"""
 
-    # kl specific params
-    use_kl_penalty: bool = False
-    use_spma: bool = False
-    mdpo_anneal_kl_penalty: bool = False
-    kl_penalty_coef: float = 0.0
-    kl_direction: str = "forward"
-    kl_estimator: str = "squared"
-    kl_upper_bound: float = float("inf")
+    update_type: str = "ppo"
     # Algorithm specific arguments
     env_id: str = "BreakoutNoFrameskip-v4"
     """the id of the environment"""
@@ -73,8 +66,6 @@ class Args:
     norm_adv: bool = True
     """Toggles advantages normalization"""
     clip_coef: float = 0.1
-    """the surrogate clipping coefficient"""
-    kl_ratio_clip_coef: float = float("inf")
     clip_vloss: bool = True
     """Toggles whether or not to use a clipped loss for the value function, as per the paper."""
     ent_coef: float = 0.01
@@ -82,12 +73,6 @@ class Args:
     vf_coef: float = 0.5
     """coefficient of the value function"""
     max_grad_norm: float = 0.5
-    """the maximum norm for the gradient clipping"""
-    target_kl: float = None
-    autotune_kl: bool = False
-    """the target KL divergence threshold"""
-    sparsity_steps: int = 1
-    """the number of steps between providing rewards (-1 is whole episode)"""
     # to be filled in runtime
     batch_size: int = 0
     """the batch size (computed in runtime)"""
@@ -226,16 +211,6 @@ if __name__ == "__main__":
 
     agent = Agent(envs).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
-    if args.use_kl_penalty and args.autotune_kl:
-        log_kl_coef = torch.tensor(
-            args.kl_penalty_coef,
-            requires_grad=True,
-            device=device,
-        )
-        kl_penalty_coef = log_kl_coef.exp().item()
-        kl_optimizer = optim.Adam([log_kl_coef], lr=args.learning_rate, eps=1e-5)
-    elif args.use_kl_penalty:
-        kl_penalty_coef = args.kl_penalty_coef
     # ALGO Logic: Storage setup
     obs = torch.zeros(
         (args.num_steps, args.num_envs) + envs.single_observation_space.shape,
@@ -262,14 +237,6 @@ if __name__ == "__main__":
             frac = 1.0 - (iteration - 1.0) / args.num_iterations
             lrnow = frac * args.learning_rate
             optimizer.param_groups[0]["lr"] = lrnow
-        if args.use_kl_penalty and args.mdpo_anneal_kl_penalty:
-            assert not args.autotune_kl, (
-                "autotune_kl is not compatible with mdpo_anneal_kl_penalty"
-            )
-            kl_penalty_coef = args.kl_penalty_coef / (
-                1 - (iteration - 1) / args.num_iterations
-            )
-        reward_sum = 0
         for step in range(args.num_steps):
             global_step += args.num_envs
             obs[step] = next_obs
@@ -289,18 +256,7 @@ if __name__ == "__main__":
                 action.cpu().numpy(),
             )
             next_done = np.logical_or(terminations, truncations)
-            if args.sparsity_steps != 1:
-                reward_sum += reward
-            if args.sparsity_steps == -1 and "final_info" in infos:
-                rewards[step] = torch.tensor(reward_sum).to(device).view(-1)
-                reward_sum = 0
-            if args.sparsity_steps > 1 and (
-                step % args.sparsity_steps == 0 or "final_info" in infos
-            ):
-                rewards[step] = torch.tensor(reward_sum).to(device).view(-1)
-                reward_sum = 0
-            if args.sparsity_steps == 1:
-                rewards[step] = torch.tensor(reward).to(device).view(-1)
+            rewards[step] = torch.tensor(reward).to(device).view(-1)
             next_obs, next_done = (
                 torch.Tensor(next_obs).to(device),
                 torch.Tensor(next_done).to(device),
@@ -362,7 +318,13 @@ if __name__ == "__main__":
         max_ratios = []
         logratios = []
         max_logratios = []
-        kl_clipfracs = []
+        one_std_adv_clipfrac = []
+        two_std_adv_clipfrac = []
+        adv_clipfracs = []
+        advantages = []
+        max_advantages = []
+        stds = []
+        max_stds = []
         for epoch in range(args.update_epochs):
             np.random.shuffle(b_inds)
             for start in range(0, args.batch_size, args.minibatch_size):
@@ -378,111 +340,17 @@ if __name__ == "__main__":
                 logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()
 
-                if args.use_kl_penalty:
-                    with torch.no_grad():
-                        old_approx_kl = (-logratio).mean()
-                        clipfracs += [
-                            ((ratio - 1.0).abs() > args.clip_coef)
-                            .float()
-                            .mean()
-                            .item(),
-                        ]
-                    if args.kl_direction == "forward":
-                        if args.kl_estimator == "low_var":
-                            approx_kl_full = compute_low_var_kl(
-                                b_logprobs[mb_inds],
-                                newlogprob,
-                            )
-                        elif args.kl_estimator == "standard":
-                            clip_logratio = torch.clamp(
-                                ratio,
-                                1 - args.kl_ratio_clip_coef,
-                                1 + args.kl_ratio_clip_coef,
-                            )
-                            clip_logratio = torch.log(clip_logratio)
-                            approx_kl_full = -clip_logratio
-                        elif args.kl_estimator == "squared":
-                            approx_kl_full = ((logratio) ** 2) / 2
-                        elif args.kl_estimator == "full":
-                            approx_kl_full = compute_full_kl(
-                                b_distributions[mb_inds],
-                                new_distribution,
-                            )
-                        else:
-                            raise ValueError(
-                                "kl_estimator must be either 'low_var', 'standard', 'squared' or 'full'",
-                            )
-                        approx_kl = approx_kl_full.mean()
-                    elif args.kl_direction == "reverse":
-                        if args.kl_estimator == "low_var":
-                            raise ValueError("low_var kl is invalid for reverse KL")
-                            approx_kl_full = compute_low_var_kl(
-                                newlogprob,
-                                b_logprobs[mb_inds],
-                            )
-                        elif args.kl_estimator == "standard":
-                            raise ValueError("standard kl is invalid for reverse KL")
-                            approx_kl_full = logratio
-                        elif args.kl_estimator == "squared":
-                            approx_kl_full = ((logratio) ** 2) / 2
-                        elif args.kl_estimator == "full":
-                            approx_kl_full = compute_full_kl(
-                                new_distribution,
-                                b_distributions[mb_inds],
-                            )
-                        else:
-                            raise ValueError(
-                                "kl_estimator must be either 'low_var', 'standard', 'squared' or 'full'",
-                            )
-                        if args.kl_estimator != "full":
-                            clip_ratio = torch.clamp(
-                                ratio,
-                                1 - args.kl_ratio_clip_coef,
-                                1 + args.kl_ratio_clip_coef,
-                            )
-                            approx_kl_full = clip_ratio * approx_kl_full
-                        approx_kl = approx_kl_full.mean()
-                    else:
-                        raise ValueError(
-                            "kl_direction must be either 'forward' or 'reverse'",
-                        )
-                else:
-                    with torch.no_grad():
-                        # calculate approx_kl http://joschu.net/blog/kl-approx.html
-                        old_approx_kl = (-logratio).mean()
-                        approx_kl = ((ratio - 1) - logratio).mean()
-                        clipfracs += [
-                            ((ratio - 1.0).abs() > args.clip_coef)
-                            .float()
-                            .mean()
-                            .item(),
-                        ]
+                with torch.no_grad():
+                    # calculate approx_kl http://joschu.net/blog/kl-approx.html
+                    old_approx_kl = (-logratio).mean()
+                    approx_kl = ((ratio - 1) - logratio).mean()
 
                 mb_advantages = b_advantages[mb_inds]
                 if args.norm_adv:
                     mb_advantages = (mb_advantages - mb_advantages.mean()) / (
                         mb_advantages.std() + 1e-8
                     )
-
-                # Policy loss
-                if args.use_kl_penalty:
-                    if args.use_spma:
-                        pg_loss1 = -mb_advantages * logratio
-                    else:
-                        pg_loss1 = -mb_advantages * ratio
-                    kl_clipfrac = (
-                        (approx_kl > args.kl_upper_bound).float().mean().item()
-                    )
-                    approx_kl = torch.clamp(approx_kl, 0, args.kl_upper_bound)
-                    kl_clipfracs.append(kl_clipfrac)
-                    pg_loss = (pg_loss1 + kl_penalty_coef * approx_kl).mean()
-                    adv_kl_ratio = (pg_loss1 / (kl_penalty_coef * approx_kl)).mean()
-                    adv_kl_ratio_no_coef = (pg_loss1 / approx_kl).mean()
-                    adv_kl_ratio_sum = (
-                        pg_loss1.sum() / (kl_penalty_coef * approx_kl).sum()
-                    )
-                    adv_kl_ratio_sum_no_coef = pg_loss1.sum() / approx_kl.sum()
-                else:
+                if args.update_type == "ppo":
                     pg_loss1 = -mb_advantages * ratio
                     pg_loss2 = -mb_advantages * torch.clamp(
                         ratio,
@@ -490,9 +358,63 @@ if __name__ == "__main__":
                         1 + args.clip_coef,
                     )
                     pg_loss = torch.max(pg_loss1, pg_loss2).mean()
-                    adv_kl_ratio_no_coef = (pg_loss1 / approx_kl).mean()
-                    adv_kl_ratio_sum_no_coef = pg_loss1.sum() / approx_kl.sum()
 
+                elif args.update_type == "half_clamp":
+                    pg_loss = (
+                        -newlogprob * torch.clamp(mb_advantages, 0, args.clip_coef)
+                    ).mean()
+                elif args.update_type == "half_std_clamp":
+                    clamp_advantages = torch.clamp(
+                        mb_advantages,
+                        0,
+                        mb_advantages.mean() + args.clip_coef * mb_advantages.std(),
+                    )
+                    pg_loss = (-newlogprob * clamp_advantages).mean()
+                elif args.update_type == "center_std_clamp":
+                    clamp_advantages = torch.clamp(
+                        mb_advantages,
+                        mb_advantages.mean() - args.clip_coef * mb_advantages.std(),
+                        mb_advantages.mean() + args.clip_coef * mb_advantages.std(),
+                    )
+                    pg_loss = (-newlogprob * clamp_advantages).mean()
+                elif args.update_type == "center_clamp":
+                    clamp_advantages = torch.clamp(
+                        mb_advantages,
+                        mb_advantages.mean() - args.clip_coef,
+                        mb_advantages.mean() + args.clip_coef,
+                    )
+                    pg_loss = (-newlogprob * clamp_advantages).mean()
+                elif args.update_type == "trefree":
+                    pg_loss = torch.clamp(-(ratio - 1)*mb_advantages, max=-args.clip_coef).mean()
+                else:
+                    raise NotImplementedError(
+                        f"update_type {args.update_type} is not implemented",
+                    )
+                clipfracs += [
+                    (ratio - 1.0).abs().gt(args.clip_coef).float().mean().item(),
+                ]
+                adv_clipfracs += [
+                    (mb_advantages.abs() > args.clip_coef).float().mean().item(),
+                ]
+                one_std_adv_clipfrac += [
+                    (mb_advantages.abs() > mb_advantages.mean() + mb_advantages.std())
+                    .float()
+                    .mean()
+                    .item(),
+                ]
+                two_std_adv_clipfrac += [
+                    (
+                        mb_advantages.abs()
+                        > mb_advantages.mean() + 2 * mb_advantages.std()
+                    )
+                    .float()
+                    .mean()
+                    .item(),
+                ]
+                advantages += [mb_advantages.mean().item()]
+                max_advantages += [mb_advantages.abs().max().item()]
+                stds += [mb_advantages.std().item()]
+                max_stds += [mb_advantages.std().abs().max().item()]
                 # Value loss
                 newvalue = newvalue.view(-1)
                 if args.clip_vloss:
@@ -524,14 +446,6 @@ if __name__ == "__main__":
                 max_logratios.append(logratio.abs().max().item())
                 optimizer.step()
                 optimizer.zero_grad()
-                if args.use_kl_penalty and args.autotune_kl:
-                    kl_optimizer.zero_grad()
-                    kl_loss = -log_kl_coef.exp() * (approx_kl.detach() - args.target_kl)
-                    kl_loss.backward()
-                    kl_optimizer.step()
-                    kl_penalty_coef = log_kl_coef.exp().item()
-                    kl_optimizer.zero_grad()
-
             # if args.target_kl is not None and approx_kl > args.target_kl:
             # break
 
@@ -543,25 +457,6 @@ if __name__ == "__main__":
         writer.add_scalar(
             "charts/learning_rate",
             optimizer.param_groups[0]["lr"],
-            global_step,
-        )
-        if args.use_kl_penalty:
-            writer.add_scalar("charts/kl_penalty_coef", kl_penalty_coef, global_step)
-            writer.add_scalar("charts/adv_kl_ratio", adv_kl_ratio, global_step)
-            writer.add_scalar("charts/adv_kl_ratio_sum", adv_kl_ratio_sum, global_step)
-            writer.add_scalar(
-                "charts/kl_clipfrac",
-                np.mean(kl_clipfracs),
-                global_step,
-            )
-        writer.add_scalar(
-            "charts/adv_kl_ratio_no_coef",
-            adv_kl_ratio_no_coef,
-            global_step,
-        )
-        writer.add_scalar(
-            "charts/adv_kl_ratio_sum_no_coef",
-            adv_kl_ratio_sum_no_coef,
             global_step,
         )
         writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
@@ -577,23 +472,58 @@ if __name__ == "__main__":
             global_step,
         )
         writer.add_scalar(
-            "losses/ratio",
+            "metrics/ratio",
             torch.mean(torch.tensor(ratios)).item(),
             global_step,
         )
         writer.add_scalar(
-            "losses/max_ratio",
+            "metrics/max_ratio",
             torch.mean(torch.tensor(max_ratios)).item(),
             global_step,
         )
         writer.add_scalar(
-            "losses/logratio",
+            "metrics/logratio",
             torch.mean(torch.tensor(logratios)).item(),
             global_step,
         )
         writer.add_scalar(
-            "losses/max_logratio",
+            "metrics/max_logratio",
             torch.mean(torch.tensor(max_logratios)).item(),
+            global_step,
+        )
+        writer.add_scalar(
+            "metrics/one_std_adv_clipfrac",
+            torch.mean(torch.tensor(one_std_adv_clipfrac)).item(),
+            global_step,
+        )
+        writer.add_scalar(
+            "metrics/two_std_adv_clipfrac",
+            torch.mean(torch.tensor(two_std_adv_clipfrac)).item(),
+            global_step,
+        )
+        writer.add_scalar(
+            "metrics/adv_clipfrac",
+            torch.mean(torch.tensor(adv_clipfracs)).item(),
+            global_step,
+        )
+        writer.add_scalar(
+            "metrics/advantages",
+            torch.mean(torch.tensor(advantages)).item(),
+            global_step,
+        )
+        writer.add_scalar(
+            "metrics/stds",
+            torch.mean(torch.tensor(stds)).item(),
+            global_step,
+        )
+        writer.add_scalar(
+            "metrics/max_advantages",
+            torch.mean(torch.tensor(max_advantages)).item(),
+            global_step,
+        )
+        writer.add_scalar(
+            "metrics/max_stds",
+            torch.mean(torch.tensor(max_stds)).item(),
             global_step,
         )
         print("SPS:", int(global_step / (time.time() - start_time)))
